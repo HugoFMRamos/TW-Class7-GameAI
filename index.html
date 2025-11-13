@@ -1,0 +1,347 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>Tilt Racer — Accelerometer-controlled Browser Game</title>
+  <style>
+    /* Minimal, modern look */
+    :root{--bg:#0f1720;--card:#0b1220;--accent:#60a5fa;--muted:#94a3b8;--danger:#fb7185}
+    html,body{height:100%;margin:0;font-family:Inter, ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial}
+    body{display:flex;align-items:center;justify-content:center;background:linear-gradient(180deg,#071025, #071122);color:#e6eef8}
+    .app{width:100%;max-width:900px;margin:18px;padding:14px;border-radius:12px;background:linear-gradient(180deg, rgba(255,255,255,0.02), rgba(255,255,255,0.01));box-shadow:0 10px 30px rgba(2,6,23,0.6)}
+    header{display:flex;gap:12px;align-items:center;justify-content:space-between;margin-bottom:10px}
+    h1{font-size:18px;margin:0}
+    .controls{display:flex;gap:8px;align-items:center}
+    button{background:transparent;border:1px solid rgba(255,255,255,0.06);padding:8px 10px;border-radius:10px;color:inherit;font-weight:600}
+    button.primary{background:linear-gradient(90deg,var(--accent),#3b82f6);border:none;color:#04233b}
+    canvas{width:100%;height:60vh;display:block;border-radius:10px;background:linear-gradient(180deg,#032034, #021827);touch-action:none}
+    .hud{display:flex;gap:12px;align-items:center}
+    .muted{color:var(--muted);font-size:13px}
+    .footer{display:flex;gap:12px;align-items:center;margin-top:10px;flex-wrap:wrap}
+    .overlay{position:absolute;inset:0;display:flex;align-items:center;justify-content:center}
+    .center-card{background:rgba(2,6,23,0.7);padding:14px;border-radius:12px;border:1px solid rgba(255,255,255,0.03)}
+    .small{font-size:13px}
+    #touchpad{position:fixed;right:18px;bottom:18px;width:120px;height:120px;border-radius:60px;border:2px dashed rgba(255,255,255,0.04);display:none;align-items:center;justify-content:center;opacity:0.9}
+    #joystick{width:56px;height:56px;border-radius:28px;background:rgba(255,255,255,0.04);display:flex;align-items:center;justify-content:center}
+    @media (max-width:640px){canvas{height:62vh}.app{margin:6px;padding:10px}}
+  </style>
+</head>
+<body>
+  <div class="app">
+    <header>
+      <h1>Tilt Racer</h1>
+      <div class="controls">
+        <div class="hud">
+          <div class="muted small">Score: <span id="score">0</span></div>
+          <div class="muted small">Best: <span id="best">0</span></div>
+        </div>
+        <button id="startBtn" class="primary">Start</button>
+        <button id="calibrateBtn">Calibrate</button>
+        <button id="permBtn">Enable Motion</button>
+      </div>
+    </header>
+
+    <main style="position:relative">
+      <canvas id="gameCanvas"></canvas>
+      <div id="centerOverlay" class="overlay" style="pointer-events:none">
+        <div class="center-card small" id="statusMsg">Press <strong>Start</strong> and allow motion permissions when asked. Works best on mobile.</div>
+      </div>
+      <div id="touchpad"><div id="joystick"></div></div>
+    </main>
+
+    <div class="footer muted small">
+      <div>Use your phone's tilt to move the racer (or use touch controls if permission denied).</div>
+      <div style="margin-left:auto">v1.0 — No external libs</div>
+    </div>
+  </div>
+
+  <script>
+  // Tilt Racer — single-file browser game using accelerometer / tilt.
+  // Features:
+  // - Uses Generic Sensor API (Accelerometer) where available and DeviceMotion/DeviceOrientation as fallback
+  // - Requests permissions on iOS via DeviceMotionEvent.requestPermission()
+  // - Fallback to on-screen joystick if sensors unavailable
+  // - Simple gameplay: avoid moving obstacles, collect points
+  // - Calibration button to zero-out device resting orientation
+  // - Stores best score in localStorage
+
+  (() => {
+    const canvas = document.getElementById('gameCanvas');
+    const ctx = canvas.getContext('2d');
+    let W = 1000, H = 1600; // internal size (will scale to device)
+    const scoreEl = document.getElementById('score');
+    const bestEl = document.getElementById('best');
+    const startBtn = document.getElementById('startBtn');
+    const permBtn = document.getElementById('permBtn');
+    const calibrateBtn = document.getElementById('calibrateBtn');
+    const statusMsg = document.getElementById('statusMsg');
+    const touchpad = document.getElementById('touchpad');
+    const joystick = document.getElementById('joystick');
+
+    let scale = 1;
+    function resize() {
+      const rect = canvas.getBoundingClientRect();
+      scale = window.devicePixelRatio || 1;
+      canvas.width = Math.max(360, Math.floor(rect.width * scale));
+      canvas.height = Math.max(640, Math.floor(rect.height * scale));
+      W = canvas.width; H = canvas.height;
+    }
+    window.addEventListener('resize', resize);
+    resize();
+
+    // Game state
+    let running = false;
+    let score = 0;
+    let best = localStorage.getItem('tilt_racer_best') || 0;
+    bestEl.textContent = best;
+
+    // Player controlled ball
+    const player = { x: W/2, y: H - 140, vx:0, vy:0, r: 28 };
+
+    // Input state
+    let tilt = { x:0, y:0 }; // desired acceleration-ish from device
+    let calibration = { x:0, y:0 };
+    let usingSensor = false;
+
+    // Obstacles
+    const obstacles = [];
+    let obstacleTimer = 0;
+
+    // Touch joystick fallback
+    let touchActive = false;
+    let touchCenter = null;
+
+    // Utility
+    function rand(a,b){return Math.random()*(b-a)+a}
+
+    function startGame(){
+      running = true; score = 0; obstacles.length = 0; player.x = W/2; player.y = H - 160; player.vx = 0; player.vy = 0; obstacleTimer = 0; statusMsg.style.display='none';
+      if (!usingSensor) { touchpad.style.display='flex'; }
+      loop(performance.now());
+    }
+
+    function endGame(){
+      running = false; statusMsg.style.display='flex'; statusMsg.innerHTML = `<div class="center-card small">Game Over — Score ${Math.floor(score)}<br><button id=retryBtn class=primary style='margin-top:8px'>Play again</button></div>`;
+      document.getElementById('retryBtn').addEventListener('click', ()=>{ startGame(); statusMsg.style.display='none'; });
+      if (score > best){ best = Math.floor(score); localStorage.setItem('tilt_racer_best', best); bestEl.textContent = best; }
+      touchpad.style.display='none';
+    }
+
+    startBtn.addEventListener('click', ()=>{ if (!running) startGame(); else { running=false; statusMsg.style.display='flex'; statusMsg.textContent='Paused'; } });
+
+    calibrateBtn.addEventListener('click', ()=>{ calibration.x = rawTilt.x; calibration.y = rawTilt.y; statusMsg.style.display='flex'; statusMsg.textContent='Calibrated'; setTimeout(()=>statusMsg.style.display='none',800); });
+
+    // Sensor handling: try Generic Sensor API first, then DeviceMotion, DeviceOrientation.
+    let rawTilt = { x:0, y:0 };
+
+    async function enableMotion() {
+      // iOS requires explicit permission
+      try {
+        if (typeof DeviceMotionEvent !== 'undefined' && typeof DeviceMotionEvent.requestPermission === 'function'){
+          const res = await DeviceMotionEvent.requestPermission();
+          if (res !== 'granted') throw new Error('permission denied');
+        }
+      } catch(e){ /* continue to try other APIs */ }
+
+      // Try Generic Sensor API Accelerometer
+      try {
+        if ('Accelerometer' in window) {
+          const acc = new Accelerometer({frequency: 60});
+          acc.addEventListener('reading', ()=>{
+            // acc.x is device x acceleration in m/s^2 (orientation dependent)
+            rawTilt.x = acc.x || 0;
+            rawTilt.y = acc.y || 0;
+            usingSensor = true;
+          });
+          acc.start();
+          statusMsg.textContent='Using Accelerometer';
+          return;
+        }
+      } catch(e){ console.warn('Accelerometer failed', e); }
+
+      // Fallback: DeviceMotionEvent
+      try {
+        window.addEventListener('devicemotion', (ev)=>{
+          if (ev.accelerationIncludingGravity){
+            rawTilt.x = ev.accelerationIncludingGravity.x || 0;
+            rawTilt.y = ev.accelerationIncludingGravity.y || 0;
+            usingSensor = true;
+          }
+        });
+        statusMsg.textContent='Using DeviceMotion';
+        return;
+      } catch(e){ console.warn('devicemotion failed', e); }
+
+      // Fallback: DeviceOrientationEvent (tilt angles)
+      try {
+        window.addEventListener('deviceorientation', (ev)=>{
+          // gamma: left-to-right tilt (-90 to 90), beta: front-to-back (-180 to 180)
+          const gamma = ev.gamma || 0; const beta = ev.beta || 0;
+          // convert to -1..1 range
+          rawTilt.x = gamma/45; rawTilt.y = beta/45;
+          usingSensor = true;
+        });
+        statusMsg.textContent='Using DeviceOrientation';
+        return;
+      } catch(e){ console.warn('deviceorientation failed', e); }
+
+      // If all fail
+      statusMsg.textContent='No motion sensors. Use on-screen control.';
+      usingSensor = false;
+      touchpad.style.display = 'flex';
+    }
+
+    permBtn.addEventListener('click', ()=>{ enableMotion(); permBtn.style.display='none'; });
+
+    // Joystick touch handling
+    let pointerId = null;
+    joystick.parentElement.addEventListener('pointerdown', (e)=>{
+      e.preventDefault(); touchActive = true; pointerId = e.pointerId; touchCenter = {x: e.clientX, y: e.clientY}; joystick.style.transform = 'translate(0,0)';
+    });
+    window.addEventListener('pointermove', (e)=>{
+      if (!touchActive || e.pointerId !== pointerId) return;
+      const dx = e.clientX - touchCenter.x; const dy = e.clientY - touchCenter.y; const max = 40; const nx = Math.max(-1, Math.min(1, dx/max)); const ny = Math.max(-1, Math.min(1, dy/max));
+      // emulate tilt values in rawTilt range
+      rawTilt.x = nx*6; rawTilt.y = ny*6;
+      joystick.style.transform = `translate(${Math.max(-32,Math.min(32,dx))}px, ${Math.max(-32,Math.min(32,dy))}px)`;
+    });
+    window.addEventListener('pointerup', (e)=>{ if (e.pointerId===pointerId){ touchActive=false; pointerId=null; rawTilt.x=0; rawTilt.y=0; joystick.style.transform='translate(0,0)'; } });
+
+    // Game loop
+    let last = 0;
+    function loop(t){
+      if (!running) return;
+      const dt = Math.min(40, t - last) / 1000; last = t;
+
+      // map rawTilt to game acceleration
+      tilt.x = (rawTilt.x - calibration.x) * 40; // tuned multiplier
+      tilt.y = (rawTilt.y - calibration.y) * 40;
+
+      // apply to player velocity
+      const ax = tilt.x; const ay = tilt.y;
+      player.vx += ax * dt;
+      player.vy += ay * dt;
+
+      // friction and clamp
+      player.vx *= 0.98; player.vy *= 0.98;
+      player.vx = Math.max(-800, Math.min(800, player.vx));
+      player.vy = Math.max(-800, Math.min(800, player.vy));
+
+      player.x += player.vx * dt;
+      player.y += player.vy * dt;
+
+      // keep in bounds
+      player.x = Math.max(player.r, Math.min(W - player.r, player.x));
+      player.y = Math.max(player.r, Math.min(H - player.r, player.y));
+
+      // obstacles spawn
+      obstacleTimer += dt;
+      if (obstacleTimer > 0.8){ obstacleTimer = 0; spawnObstacle(); }
+
+      // update obstacles
+      for (let i = obstacles.length-1; i>=0; --i){
+        const o = obstacles[i]; o.y += o.speed * dt;
+        if (o.y - o.h > H) obstacles.splice(i,1);
+      }
+
+      // collisions
+      for (const o of obstacles){
+        if (circleRectCollision(player.x, player.y, player.r, o.x, o.y, o.w, o.h)){
+          endGame(); return;
+        }
+      }
+
+      // increase score gradually
+      score += 20 * dt; scoreEl.textContent = Math.floor(score);
+
+      // draw
+      render();
+
+      requestAnimationFrame(loop);
+    }
+
+    function spawnObstacle(){
+      const w = rand(120, 320); const h = rand(36, 70);
+      const x = rand(0, W - w); const y = -h - 10;
+      const speed = rand(120, 350) + (score/200);
+      obstacles.push({x,y,w,h,speed});
+      // also sometimes spawn a gap (moving walls)
+      if (Math.random() < 0.15){ // wide wall with hole
+        const wallW = rand(60, 180); const holeX = rand(80, W-80-wallW);
+        obstacles.push({x:0,y:-90,w:holeX,h:70,speed});
+        obstacles.push({x:holeX+wallW,y:-90,w:W-holeX-wallW,h:70,speed});
+      }
+    }
+
+    function circleRectCollision(cx,cy,r, rx,ry,rw,rh){
+      // rx,ry is top-left
+      const closestX = clamp(cx, rx, rx + rw);
+      const closestY = clamp(cy, ry, ry + rh);
+      const dx = cx - closestX; const dy = cy - closestY;
+      return (dx*dx + dy*dy) < (r*r);
+    }
+    function clamp(v,a,b){return Math.max(a, Math.min(b, v));}
+
+    function render(){
+      ctx.clearRect(0,0,W,H);
+
+      // background gradient
+      const g = ctx.createLinearGradient(0,0,0,H);
+      g.addColorStop(0,'#021827'); g.addColorStop(1,'#01121b');
+      ctx.fillStyle = g; ctx.fillRect(0,0,W,H);
+
+      // draw obstacles
+      ctx.fillStyle = '#11334a';
+      for (const o of obstacles){ ctx.fillRect(o.x, o.y, o.w, o.h); }
+
+      // player shadow
+      ctx.beginPath(); ctx.ellipse(player.x, player.y + player.r*0.6, player.r*1.1, player.r*0.6, 0,0,Math.PI*2); ctx.fillStyle='rgba(0,0,0,0.35)'; ctx.fill();
+
+      // player body
+      ctx.beginPath(); ctx.arc(player.x, player.y, player.r, 0, Math.PI*2); ctx.fillStyle='#60a5fa'; ctx.fill();
+      ctx.lineWidth = 3; ctx.strokeStyle = 'rgba(0,0,0,0.15)'; ctx.stroke();
+
+      // simple direction indicator
+      ctx.beginPath(); ctx.moveTo(player.x, player.y); ctx.lineTo(player.x - player.vx*0.02, player.y - player.vy*0.02); ctx.strokeStyle='rgba(2,6,23,0.3)'; ctx.lineWidth=2; ctx.stroke();
+
+      // HUD (drawn on canvas for crispness)
+      ctx.font = `${28 * (scale||1)}px system-ui`; ctx.fillStyle = '#e6eef8'; ctx.fillText('Score: ' + Math.floor(score), 20 * (scale||1), 44 * (scale||1));
+    }
+
+    // initial render
+    render();
+
+    // utility/setup
+    function clamp(v,a,b){return Math.max(a, Math.min(b, v));}
+
+    // start permission prompt automatically on supported devices? leave to user
+
+    // show touchpad if sensor not yet enabled
+    touchpad.style.display = 'none';
+
+    // expose enableMotion on load for some browsers
+    window.enableMotion = enableMotion;
+
+    // friendly instruction if desktop
+    if (!('ontouchstart' in window)){
+      statusMsg.textContent = 'Try this on a phone for accelerometer controls — desktop supports keyboard: arrow keys.';
+      // keyboard fallback
+      window.addEventListener('keydown', (e)=>{
+        const speed = 200;
+        if (e.key === 'ArrowLeft') player.x -= speed * 0.06;
+        if (e.key === 'ArrowRight') player.x += speed * 0.06;
+        if (e.key === 'ArrowUp') player.y -= speed * 0.06;
+        if (e.key === 'ArrowDown') player.y += speed * 0.06;
+      });
+    }
+
+    // keyboard for testing on desktop
+
+    // ensure canvas size updates to computed layout
+    (function layoutLoop(){ resize(); requestAnimationFrame(layoutLoop); })();
+
+  })();
+  </script>
+</body>
+</html>
